@@ -30,6 +30,52 @@ export default function Home() {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [researchMessages, log]);
 
+  const escapeHtml = (unsafe: string) => {
+    return unsafe
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&#039;');
+  };
+
+  const exportChatAsPDF = () => {
+    try {
+      const title = `Research_Chat_${runId || 'no-run'}`;
+      let body = `<div style="font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#111;">`;
+      body += `<h1 style="font-size:20px;margin-bottom:8px;">Research Chat ${runId ? `- Run ${runId}` : ''}</h1>`;
+      body += `<div style="margin-top:12px;">`;
+      researchMessages.forEach((m) => {
+        body += `<div style="margin:10px 0;padding:10px;border-radius:8px;background:${m.role === 'user' ? '#e7f0ff' : '#f3f4f6'};">`;
+        body += `<div style="font-weight:600;margin-bottom:6px;">${escapeHtml(m.role.toUpperCase())}</div>`;
+        body += `<div style="white-space:pre-wrap;">${escapeHtml(String(m.text || ''))}</div>`;
+        body += `</div>`;
+      });
+      body += `</div>`;
+
+      if (cam) {
+        body += `<h2 style="margin-top:18px;font-size:16px;">CAM (summary)</h2>`;
+        body += `<pre style="background:#f8fafc;padding:12px;border-radius:6px;overflow:auto;max-height:400px;">${escapeHtml(JSON.stringify(cam, null, 2))}</pre>`;
+      }
+
+      body += `</div>`;
+
+      const w = window.open('', '_blank', 'width=900,height=700');
+      if (!w) {
+        appendLog('Popup blocked: allow popups to export PDF');
+        return;
+      }
+      w.document.write(`<!doctype html><html><head><title>${title}</title></head><body>${body}</body></html>`);
+      w.document.close();
+      setTimeout(() => {
+        w.focus();
+        w.print();
+      }, 300);
+    } catch (err) {
+      appendLog(`Export error: ${String(err)}`);
+    }
+  };
+
   // Notes are now stored locally in state and persist in UI
 
   async function ingestRun(run_id: string) {
@@ -283,6 +329,13 @@ export default function Home() {
               <span className="text-xs text-indigo-300 font-mono bg-indigo-500/10 px-3 py-1.5 rounded-lg border border-indigo-500/20 shadow-sm">
                 Run: {runId}
               </span>
+              <button
+                onClick={exportChatAsPDF}
+                className="ml-2 bg-slate-800/40 text-slate-200 px-3 py-1.5 rounded-lg border border-slate-700/40 text-xs hover:bg-indigo-600/80 hover:text-white transition-all duration-150"
+                title="Export chat as PDF"
+              >
+                Export PDF
+              </button>
             </div>
           )}
         </header>
@@ -434,7 +487,7 @@ export default function Home() {
 
       <aside className="w-[340px] bg-[#111827] border-l border-slate-800 flex flex-col z-10 shadow-[-4px_0_24px_rgba(0,0,0,0.2)] relative">
         <div className="p-6 border-b border-slate-800 bg-[#111827]/80 backdrop-blur">
-          <h2 className="text-lg font-bold text-slate-100 tracking-tight">Studio</h2>
+          <h2 className="text-lg font-bold text-slate-100 tracking-tight">Analysis</h2>
           <p className="text-xs text-slate-500 mt-1 font-medium">Insights and metadata</p>
         </div>
 
@@ -450,7 +503,7 @@ export default function Home() {
               onChange={(e) => setNotes(e.target.value)} 
               rows={5} 
               className="w-full p-3 bg-slate-900/50 rounded-xl border border-amber-500/30 text-xs text-slate-200 focus:outline-none focus:ring-1 focus:ring-amber-500/50 focus:border-amber-500/50 focus:bg-slate-900/70 resize-none transition-all duration-200 placeholder-slate-600" 
-              placeholder="Capture insights here... (markdown supported)" 
+              placeholder="Capture insights here" 
             />
           </div>
 
