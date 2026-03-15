@@ -1,6 +1,8 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 export default function Home() {
   const [files, setFiles] = useState<FileList | null>(null);
@@ -12,8 +14,10 @@ export default function Home() {
   const [uploadedFilesList, setUploadedFilesList] = useState<string[]>([]);
   const [selectedFilesNames, setSelectedFilesNames] = useState<string[]>([]);
   const [researchPlan, setResearchPlan] = useState<any>(null);
-  const [researchMessages, setResearchMessages] = useState<Array<{ role: string; text: string }>>([]);
+  const [researchMessages, setResearchMessages] = useState<Array<{ role: string; text: string; web_search?: any }>>([]);
   const [researchInput, setResearchInput] = useState("");
+  const [webSearchEnabled, setWebSearchEnabled] = useState(false);
+  const [uploadMode, setUploadMode] = useState(true); // true = selecting, false = uploaded
 
   const chatEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -25,6 +29,8 @@ export default function Home() {
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [researchMessages, log]);
+
+  // Notes are now stored locally in state and persist in UI
 
   async function ingestRun(run_id: string) {
     setLoading(true);
@@ -55,6 +61,9 @@ export default function Home() {
       if (j.run_id) {
         setRunId(j.run_id);
         setUploadedFilesList(j.filenames || []);
+        setUploadMode(false); // Hide selection UI after upload
+        setSelectedFilesNames([]); // Clear pending files
+        setFiles(null);
         appendLog(`Uploaded run_id ${j.run_id}`);
         await ingestRun(j.run_id);
       } else {
@@ -66,40 +75,17 @@ export default function Home() {
     setLoading(false);
   }
 
-  const handleFolderUpload = async () => {
-    try {
-      setLoading(true);
-      appendLog("Uploading files from folder...");
-      const res = await fetch("/api/uploadFromFolder", { method: "POST" });
-      const data = await res.json();
-      if (res.ok) {
-        appendLog(`Uploaded files: ${data.files.map((f: any) => f.name).join(", ")}`);
-      } else {
-        appendLog(`Upload failed: ${data.error}`);
-      }
-    } catch (error) {
-      appendLog(`Upload error: ${String(error)}`);
-    } finally {
-      setLoading(false);
+  const removeUploadedFile = (filename: string) => {
+    setUploadedFilesList(uploadedFilesList.filter(f => f !== filename));
+    if (uploadedFilesList.length === 1) {
+      // If removing the last file, reset to upload mode
+      setUploadMode(true);
+      setRunId(null);
+      setNotes("");
     }
   }
 
-  async function handleNotesSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    if (!runId) return appendLog("No run_id. Upload files first.");
-    setLoading(true);
-    appendLog("Saving primary insights...");
-    try {
-      const fd = new FormData();
-      fd.append("run_id", runId);
-      fd.append("notes", notes);
-      await fetch(`${backend}/primary_insights`, { method: "POST", body: fd });
-      appendLog(`Notes saved`);
-    } catch (err) {
-      appendLog(`Notes error: ${String(err)}`);
-    }
-    setLoading(false);
-  }
+
 
   async function fetchCam() {
     if (!runId) return appendLog("No run_id. Upload files first.");
@@ -125,8 +111,12 @@ export default function Home() {
       fd.append("run_id", runId);
       const res = await fetch(`${backend}/research/initiate`, { method: "POST", body: fd });
       const j = await res.json();
-      appendLog(`Research initiated`);
-      setResearchPlan(j.llm_raw || j);
+      if (j.error) {
+        appendLog(`Research error: ${j.error}`);
+      } else {
+        appendLog(`Research initiated`);
+        setResearchPlan(j.llm_raw || j);
+      }
     } catch (err) {
       appendLog(`Research error: ${String(err)}`);
     }
@@ -144,19 +134,55 @@ export default function Home() {
     setLoading(true);
 
     try {
+      const url = `${backend}/research/chat`;
       const fd = new FormData();
       fd.append("run_id", runId);
       fd.append("message", msg);
-      const res = await fetch(`${backend}/research/chat`, { method: "POST", body: fd });
-      if (!res.ok) {
-        throw new Error(`Server error: ${res.status}`);
+      fd.append("web_search", webSearchEnabled ? "true" : "false");
+      
+      appendLog(`[DEBUG] Backend URL: ${url}`);
+      appendLog(`[DEBUG] Web search: ${webSearchEnabled ? "ENABLED" : "disabled"}`);
+      appendLog(`[DEBUG] Sending request with run_id=${runId}, message="${msg.slice(0, 30)}..."`);
+      
+      const res = await fetch(url, { 
+        method: "POST", 
+        body: fd,
+      });
+      
+      appendLog(`[DEBUG] Got response with status ${res.status}`);
+      
+      if (!res.ok && res.status !== 200) {
+        const text = await res.text();
+        throw new Error(`HTTP ${res.status}: ${text.slice(0, 100)}`);
       }
-      const j = await res.json();
-      const assistant = j.assistant || j;
-      setResearchMessages((m) => [...m, { role: "assistant", text: JSON.stringify(assistant).slice(0, 1000) }]);
+      
+      let j;
+      try {
+        j = await res.json();
+        appendLog(`[DEBUG] Parsed JSON response`);
+      } catch (parseErr) {
+        const text = await res.text();
+        appendLog(`[ERROR] Failed to parse JSON: ${text.slice(0, 150)}`);
+        throw new Error(`Invalid JSON response: ${text.slice(0, 100)}`);
+      }
+      
+      if (j.error) {
+        appendLog(`[ERROR] Server returned error: ${j.error}`);
+        setResearchMessages((m) => [...m, { role: "assistant", text: `Error: ${j.error}` }]);
+      } else {
+        const assistant = j.assistant || "";
+        appendLog(`[SUCCESS] Got response`);
+        const msgData: any = { role: "assistant", text: String(assistant) };
+        if (j.web_search) {
+          msgData.web_search = j.web_search;
+          appendLog(`[WEB] Web search completed: ${Object.keys(j.web_search.sources).length} sources`);
+        }
+        setResearchMessages((m) => [...m, msgData]);
+      }
     } catch (err) {
-      appendLog(`Research chat error: ${String(err)}`);
-      setResearchMessages((m) => [...m, { role: "assistant", text: "Error: Unable to fetch response." }]);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      appendLog(`[CATCH] Fetch error: ${errMsg}`);
+      setResearchMessages((m) => [...m, { role: "assistant", text: `Error: ${errMsg}` }]);
     } finally {
       setLoading(false);
     }
@@ -198,7 +224,7 @@ export default function Home() {
               Select Files
             </button>
 
-            {selectedFilesNames.length > 0 && (
+            {uploadMode && selectedFilesNames.length > 0 && (
               <div className="bg-slate-900 rounded-2xl p-4 border border-slate-800 shadow-inner">
                 <p className="text-[10px] font-bold text-slate-500 mb-3 uppercase tracking-widest">Pending Upload</p>
                 <div className="space-y-2 max-h-32 overflow-y-auto pr-2 custom-scrollbar">
@@ -216,13 +242,6 @@ export default function Home() {
               </div>
             )}
 
-            <button
-              onClick={handleFolderUpload}
-              disabled={loading}
-              className="w-full bg-slate-800 border border-slate-700 text-slate-200 text-sm py-2.5 rounded-xl font-medium hover:bg-slate-700 hover:border-slate-600 transition-all duration-200 active:scale-95 disabled:opacity-50"
-            >
-              Upload from Folder
-            </button>
           </div>
 
           <div className="pt-5 border-t border-slate-800">
@@ -232,13 +251,22 @@ export default function Home() {
             ) : (
               <div className="space-y-2.5">
                 {uploadedFilesList.map((fn, i) => (
-                  <div key={i} className="flex items-center gap-3 p-3 bg-slate-800/40 border border-slate-700/50 rounded-xl hover:bg-slate-800 hover:border-slate-600 transition-all duration-200 cursor-default group">
+                  <div key={i} className="flex items-center gap-3 p-3 bg-slate-800/40 border border-slate-700/50 rounded-xl hover:bg-slate-800 hover:border-slate-600 transition-all duration-200 group">
                     <div className="w-8 h-8 rounded-lg bg-indigo-500/10 flex items-center justify-center text-indigo-400 flex-shrink-0 group-hover:scale-110 transition-transform">
                       <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
                       </svg>
                     </div>
-                    <span className="text-sm font-medium text-slate-300 truncate">{fn}</span>
+                    <span className="text-sm font-medium text-slate-300 truncate flex-1">{fn}</span>
+                    <button
+                      onClick={() => removeUploadedFile(fn)}
+                      className="flex-shrink-0 w-6 h-6 rounded bg-slate-700/50 flex items-center justify-center text-slate-400 hover:bg-rose-500/20 hover:text-rose-400 transition-all duration-200 active:scale-90"
+                      title="Remove source"
+                    >
+                      <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                      </svg>
+                    </button>
                   </div>
                 ))}
               </div>
@@ -276,15 +304,73 @@ export default function Home() {
             )}
 
             {researchMessages.map((m, i) => (
-              <div key={i} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
-                <div 
-                  className={`max-w-[85%] rounded-3xl p-5 text-[15px] leading-relaxed shadow-lg ${
-                    m.role === "user" 
-                      ? "bg-indigo-600 text-white rounded-tr-sm shadow-indigo-900/20" 
-                      : "bg-[#111827] border border-slate-700 text-slate-200 rounded-tl-sm shadow-black/20"
-                  }`}
-                >
-                  {m.text}
+              <div key={i} className="space-y-3">
+                {/* Web Search Results */}
+                {m.web_search && (
+                  <div className="flex justify-start">
+                    <div className="max-w-[85%] bg-gradient-to-r from-cyan-900/20 to-blue-900/20 border border-cyan-500/30 rounded-3xl rounded-tl-sm p-5 text-xs leading-relaxed shadow-lg">
+                      <div className="font-bold text-cyan-400 mb-3 flex items-center gap-2">
+                        <svg width="16" height="16" fill="currentColor" viewBox="0 0 24 24">
+                          <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm3.5-9c.83 0 1.5-.67 1.5-1.5S16.33 8 15.5 8 14 8.67 14 9.5s.67 1.5 1.5 1.5zm-7 0c.83 0 1.5-.67 1.5-1.5S9.33 8 8.5 8 7 8.67 7 9.5 7.67 11 8.5 11zm3.5 6.5c2.33 0 4.31-1.46 5.11-3.5H6.89c.8 2.04 2.78 3.5 5.11 3.5z" />
+                        </svg>
+                        Web Search Results
+                      </div>
+                      <div className="space-y-2">
+                        {Object.entries(m.web_search.sources).map(([sourceName, sourceData]: [string, any]) => (
+                          <div key={sourceName}>
+                            {sourceData.status === "success" && sourceData.count > 0 && (
+                              <div className="space-y-1">
+                                <div className="font-semibold text-cyan-300 text-xs">{sourceName} <span className="text-cyan-500/70">({sourceData.count})</span></div>
+                                {sourceData.results.slice(0, 2).map((result: any, idx: number) => (
+                                  <div key={idx} className="text-xs text-slate-300 pl-2 border-l border-cyan-500/50">
+                                    <div className="font-medium text-cyan-200">{result.title || result.name || "Result"}</div>
+                                    <div className="text-slate-400 text-xs">{(result.snippet || result.description || "").substring(0, 120)}...</div>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                )}
+                
+                {/* Chat Message */}
+                <div className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
+                  <div 
+                    className={`max-w-[85%] rounded-3xl p-5 text-[15px] leading-relaxed shadow-lg ${
+                      m.role === "user" 
+                        ? "bg-indigo-600 text-white rounded-tr-sm shadow-indigo-900/20" 
+                        : "bg-[#111827] border border-slate-700 text-slate-200 rounded-tl-sm shadow-black/20"
+                    }`}
+                  >
+                    {m.role === "assistant" ? (
+                      <ReactMarkdown 
+                        remarkPlugins={[remarkGfm]}
+                        components={{
+                          div: ({ children }) => <div className="space-y-2">{children}</div>,
+                          h1: ({ children }) => <h2 className="text-lg font-bold mt-3 mb-2">{children}</h2>,
+                          h2: ({ children }) => <h3 className="text-base font-bold mt-2 mb-1">{children}</h3>,
+                          h3: ({ children }) => <h4 className="font-bold">{children}</h4>,
+                          p: ({ children }) => <p className="mb-2">{children}</p>,
+                          ul: ({ children }) => <ul className="list-disc list-inside mb-2 ml-2">{children}</ul>,
+                          ol: ({ children }) => <ol className="list-decimal list-inside mb-2 ml-2">{children}</ol>,
+                          li: ({ children }) => <li className="mb-1">{children}</li>,
+                          code: ({ children }) => <code className="bg-slate-900/50 px-1.5 py-0.5 rounded text-yellow-300 text-sm">{children}</code>,
+                          pre: ({ children }) => <pre className="bg-slate-900/50 p-3 rounded mb-2 overflow-x-auto text-xs text-green-300">{children}</pre>,
+                          blockquote: ({ children }) => <blockquote className="border-l-4 border-indigo-500 pl-3 italic text-slate-400 my-2">{children}</blockquote>,
+                          strong: ({ children }) => <strong className="font-bold text-white">{children}</strong>,
+                          em: ({ children }) => <em className="italic">{children}</em>,
+                          a: ({ href, children }) => <a href={href} className="text-indigo-400 underline hover:text-indigo-300">{children}</a>,
+                        }}
+                      >
+                        {m.text}
+                      </ReactMarkdown>
+                    ) : (
+                      <span>{m.text}</span>
+                    )}
+                  </div>
                 </div>
               </div>
             ))}
@@ -307,24 +393,40 @@ export default function Home() {
           <div className="max-w-4xl mx-auto pointer-events-auto">
             <form 
               onSubmit={researchChatSend} 
-              className="bg-[#111827]/90 backdrop-blur-md border border-slate-700 rounded-full p-2 flex items-center shadow-[0_8px_30px_rgba(0,0,0,0.4)] focus-within:ring-2 focus-within:ring-indigo-500/50 focus-within:border-indigo-500 transition-all duration-300"
+              className="bg-[#111827]/90 backdrop-blur-md border border-slate-700 rounded-2xl shadow-[0_8px_30px_rgba(0,0,0,0.4)] overflow-hidden transition-all duration-300 focus-within:ring-2 focus-within:ring-indigo-500/50 focus-within:border-indigo-500"
             >
-              <input 
-                value={researchInput} 
-                onChange={(e) => setResearchInput(e.target.value)} 
-                placeholder="Ask a question about your sources..." 
-                className="flex-1 bg-transparent px-5 py-3 outline-none text-slate-200 placeholder-slate-500 text-[15px]"
-                disabled={!runId || loading}
-              />
-              <button
-                type="submit"
-                disabled={!runId || loading || !researchInput.trim()}
-                className="bg-indigo-600 text-white w-12 h-12 rounded-full flex items-center justify-center hover:bg-indigo-500 hover:shadow-[0_0_20px_rgba(79,70,229,0.5)] transition-all duration-200 active:scale-90 disabled:opacity-40 disabled:hover:shadow-none disabled:active:scale-100 disabled:bg-slate-700 ml-2"
-              >
-                <svg width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5} className="ml-0.5">
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M14 5l7 7m0 0l-7 7m7-7H3" />
-                </svg>
-              </button>
+              {/* Input Area */}
+              <div className="flex items-center p-2">
+                <input 
+                  value={researchInput} 
+                  onChange={(e) => setResearchInput(e.target.value)} 
+                  placeholder="Ask a question about your sources..." 
+                  className="flex-1 bg-transparent px-5 py-3 outline-none text-slate-200 placeholder-slate-500 text-[15px]"
+                  disabled={!runId || loading}
+                />
+                <button
+                  type="submit"
+                  disabled={!runId || loading || !researchInput.trim()}
+                  className="bg-indigo-600 text-white w-12 h-12 rounded-full flex items-center justify-center hover:bg-indigo-500 hover:shadow-[0_0_20px_rgba(79,70,229,0.5)] transition-all duration-200 active:scale-90 disabled:opacity-40 disabled:hover:shadow-none disabled:active:scale-100 disabled:bg-slate-700 ml-2"
+                >
+                  <svg width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5} className="ml-0.5">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M14 5l7 7m0 0l-7 7m7-7H3" />
+                  </svg>
+                </button>
+              </div>
+              
+              {/* Tools Section - Embedded */}
+              <div className="border-t border-slate-700 px-4 py-2 bg-slate-900/30 flex items-center">
+                <button 
+                  onClick={() => setWebSearchEnabled(!webSearchEnabled)}
+                  className="flex items-center gap-2 px-4 py-2.5 rounded-full bg-slate-800/50 border border-slate-700/50 text-slate-300 text-sm font-medium hover:bg-slate-800 hover:border-slate-600 transition-all duration-200 cursor-pointer group active:scale-95"
+                >
+                  <svg width="16" height="16" fill="currentColor" viewBox="0 0 24 24" className={`transition-colors ${webSearchEnabled ? "text-cyan-400" : "group-hover:text-cyan-400"}`}>
+                    <path d="M15.5 1h-8C6.12 1 5 2.12 5 3.5v17C5 21.88 6.12 23 7.5 23h8c1.38 0 2.5-1.12 2.5-2.5v-17C18 2.12 16.88 1 15.5 1zm-4 21c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm4.5-4H7V4h9v14z" />
+                  </svg>
+                  <span className={webSearchEnabled ? "text-cyan-400" : "text-slate-400"}>Search Web</span>
+                </button>
+              </div>
             </form>
           </div>
         </div>
@@ -337,44 +439,34 @@ export default function Home() {
         </div>
 
         <div className="flex-1 overflow-y-auto p-5 flex flex-col gap-6 custom-scrollbar">
-          <form onSubmit={handleNotesSubmit} className="flex flex-col gap-3">
-            <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Primary Notes</label>
+          {/* Notes Section */}
+          <div className="space-y-3 bg-amber-500/5 rounded-2xl p-4 border border-amber-500/20">
+            <div className="flex items-center justify-between">
+              <label className="text-[10px] font-bold text-amber-600 uppercase tracking-widest">Primary Notes</label>
+            </div>
+            
             <textarea 
               value={notes} 
               onChange={(e) => setNotes(e.target.value)} 
               rows={5} 
-              className="w-full p-4 bg-amber-500/5 rounded-2xl border border-amber-500/20 text-sm text-slate-300 focus:outline-none focus:ring-1 focus:ring-amber-500/50 focus:border-amber-500/50 focus:bg-amber-500/10 resize-none transition-all duration-200 placeholder-slate-600" 
-              placeholder="Capture primary insights here..." 
+              className="w-full p-3 bg-slate-900/50 rounded-xl border border-amber-500/30 text-xs text-slate-200 focus:outline-none focus:ring-1 focus:ring-amber-500/50 focus:border-amber-500/50 focus:bg-slate-900/70 resize-none transition-all duration-200 placeholder-slate-600" 
+              placeholder="Capture insights here... (markdown supported)" 
             />
-            <button
-              type="submit"
-              disabled={!runId || loading}
-              className="w-full bg-slate-800 border border-slate-700 text-slate-200 text-sm py-2.5 rounded-xl font-medium hover:bg-slate-700 hover:border-slate-600 transition-all duration-200 active:scale-95 disabled:opacity-50"
-            >
-              Save Notes
-            </button>
-          </form>
+          </div>
 
           <div className="pt-5 border-t border-slate-800 space-y-3">
             <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Actions</label>
-            <div className="grid grid-cols-2 gap-3">
-              <button 
-                onClick={initiateResearch} 
-                disabled={!runId || loading}
-                className="bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 text-xs py-2.5 px-3 rounded-xl font-semibold hover:bg-indigo-500/20 hover:border-indigo-500/30 transition-all duration-200 active:scale-95 disabled:opacity-50"
-              >
-                Start Agent
-              </button>
+            <div className="space-y-2">
               <button 
                 onClick={fetchCam} 
                 disabled={!runId || loading}
-                className="bg-slate-800 text-slate-300 border border-slate-700 text-xs py-2.5 px-3 rounded-xl font-semibold hover:bg-slate-700 transition-all duration-200 active:scale-95 disabled:opacity-50"
+                className="w-full bg-slate-800 text-slate-300 border border-slate-700 text-xs py-2.5 px-3 rounded-xl font-semibold hover:bg-slate-700 transition-all duration-200 active:scale-95 disabled:opacity-50"
               >
                 Fetch CAM
               </button>
               <button 
                 onClick={() => { setResearchMessages([]); setResearchPlan(null); }} 
-                className="col-span-2 bg-rose-500/10 text-rose-400 border border-rose-500/20 text-xs py-2.5 px-3 rounded-xl font-semibold hover:bg-rose-500/20 hover:border-rose-500/30 transition-all duration-200 active:scale-[0.98]"
+                className="w-full bg-rose-500/10 text-rose-400 border border-rose-500/20 text-xs py-2.5 px-3 rounded-xl font-semibold hover:bg-rose-500/20 hover:border-rose-500/30 transition-all duration-200 active:scale-[0.98]"
               >
                 Clear Research
               </button>
@@ -382,12 +474,88 @@ export default function Home() {
           </div>
 
           {cam && (
-             <div className="pt-5 border-t border-slate-800 animate-in fade-in slide-in-from-bottom-2 duration-300">
-              <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest flex justify-between">
-                <span>CAM Output</span>
-              </label>
-              <div className="mt-3 bg-[#0a0f1a] border border-slate-800 text-emerald-400/90 rounded-2xl p-4 text-xs font-mono overflow-auto max-h-48 custom-scrollbar shadow-inner">
-                <pre>{JSON.stringify(cam, null, 2)}</pre>
+            <div className="pt-5 border-t border-slate-800 animate-in fade-in slide-in-from-bottom-2 duration-300">
+              <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">CAM Analysis</label>
+              
+              <div className="mt-4 space-y-3">
+                {/* Recommendation Card */}
+                <div className={`rounded-2xl p-4 border ${cam.recommendation?.decision === "APPROVE" ? "bg-emerald-900/20 border-emerald-500/30" : "bg-rose-900/20 border-rose-500/30"}`}>
+                  <div className="flex items-baseline gap-3">
+                    <span className={`text-2xl font-bold ${cam.recommendation?.decision === "APPROVE" ? "text-emerald-400" : "text-rose-400"}`}>
+                      {cam.recommendation?.decision}
+                    </span>
+                    <span className={`text-xs font-medium ${cam.recommendation?.decision === "APPROVE" ? "text-emerald-300" : "text-rose-300"}`}>
+                      Credit Decision
+                    </span>
+                  </div>
+                </div>
+
+                {/* Summary Stats */}
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="bg-slate-800/40 rounded-xl p-3 border border-slate-700/50">
+                    <p className="text-[10px] text-slate-500 font-semibold mb-1">Revenue</p>
+                    <p className="text-sm font-bold text-slate-100">
+                      ₹{(Math.round(cam.summary?.total_revenue / 10000000) / 100).toFixed(2)}Cr
+                    </p>
+                  </div>
+                  <div className="bg-slate-800/40 rounded-xl p-3 border border-slate-700/50">
+                    <p className="text-[10px] text-slate-500 font-semibold mb-1">PAT</p>
+                    <p className="text-sm font-bold text-slate-100">
+                      ₹{(Math.round(cam.summary?.total_pat / 10000000) / 100).toFixed(2)}Cr
+                    </p>
+                  </div>
+                  <div className="bg-slate-800/40 rounded-xl p-3 border border-slate-700/50">
+                    <p className="text-[10px] text-slate-500 font-semibold mb-1">Risk Flags</p>
+                    <p className="text-sm font-bold text-amber-400">{cam.summary?.flags || 0}</p>
+                  </div>
+                  <div className="bg-slate-800/40 rounded-xl p-3 border border-slate-700/50">
+                    <p className="text-[10px] text-slate-500 font-semibold mb-1">Litigation</p>
+                    <p className="text-sm font-bold text-rose-400">{cam.summary?.litigation || 0}</p>
+                  </div>
+                </div>
+
+                {/* Credit Limit & Rate */}
+                <div className="bg-indigo-900/20 rounded-xl p-3 border border-indigo-500/30">
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <p className="text-[10px] text-indigo-300 font-semibold mb-1">Suggested Limit</p>
+                      <p className="text-sm font-bold text-indigo-200">
+                        ₹{(Math.round(cam.recommendation?.suggested_limit_inr / 10000000) / 100).toFixed(2)}Cr
+                      </p>
+                    </div>
+                    <div>
+                      <p className="text-[10px] text-indigo-300 font-semibold mb-1">Suggested Rate</p>
+                      <p className="text-sm font-bold text-indigo-200">
+                        {(cam.recommendation?.suggested_rate * 100).toFixed(2)}%
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Reason */}
+                {cam.recommendation?.reason && cam.recommendation.reason.length > 0 && (
+                  <div className="bg-slate-800/40 rounded-xl p-3 border border-slate-700/50">
+                    <p className="text-[10px] text-slate-500 font-semibold mb-2">Notes</p>
+                    <ul className="space-y-1">
+                      {cam.recommendation.reason.map((r: string, i: number) => (
+                        <li key={i} className="text-xs text-slate-300 flex gap-2">
+                          <span className="text-slate-500 flex-shrink-0">•</span>
+                          <span>{r}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                {/* Primary Insights */}
+                {cam.summary?.primary_insights && (
+                  <div className="bg-amber-900/20 rounded-xl p-3 border border-amber-500/30">
+                    <p className="text-[10px] text-amber-300 font-semibold mb-2">Key Insights</p>
+                    <p className="text-xs text-amber-100 leading-relaxed whitespace-pre-wrap">
+                      {cam.summary.primary_insights}
+                    </p>
+                  </div>
+                )}
               </div>
             </div>
           )}
